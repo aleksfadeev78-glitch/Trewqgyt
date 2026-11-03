@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <title>AR Snake - змейка в реальной жизни</title>
+
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0;
+    }
+
+    #video,
+    #canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* Зеркалим только фронтальную камеру, чтобы было привычно пользователю */
+    #stage.mirror #video,
+    #stage.mirror #canvas {
+      transform: scaleX(-1);
+    }
+
+    #hud {
+      position: fixed;
+      left: 10px;
+      right: 10px;
+      top: max(10px, env(safe-area-inset-top));
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 5;
+      pointer-events: none;
+      flex-wrap: wrap;
+    }
+
+    #hud .pill {
+      background: rgba(0, 0, 0, 0.45);
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: 999px;
+      backdrop-filter: blur(8px);
+      font-size: 14px;
+      line-height: 1.2;
+      max-width: 100%;
+    }
+
+    #hud button {
+      pointer-events: auto;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 12px;
+      font-weight: 800;
+      background: #22c55e;
+      color: #04140a;
+      cursor: pointer;
+    }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(0, 0, 0, 0.35);
+    }
+
+    .panel {
+      width: min(560px, 100%);
+      background: rgba(8, 10, 12, 0.86);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 24px;
+      padding: 24px;
+      box-shadow: 0 20px 80px rgba(0, 0, 0, 0.45);
+    }
+
+    .panel h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+    }
+
+    .panel p {
+      line-height: 1.45;
+      color: rgba(255, 255, 255, 0.82);
+    }
+
+    .panel button {
+      margin-top: 14px;
+      width: 100%;
+      border: 0;
+      border-radius: 16px;
+      padding: 14px 18px;
+      font-size: 18px;
+      font-weight: 900;
+      background: #22c55e;
+      color: #04140a;
+      cursor: pointer;
+    }
+
+    .panel label {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 12px;
+      color: rgba(255, 255, 255, 0.85);
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <div id="hud" hidden>
+    <div class="pill">Хвост: <b id="score">0</b> · Цели: <span id="targets">0</span></div>
+    <div class="pill" id="status">Инициализация…</div>
+    <button id="switchBtn" title="Переключить фронтальную/заднюю камеру">Камера</button>
+    <button id="restartBtn" title="Начать заново">Заново</button>
+  </div>
+
+  <div id="overlay">
+    <div class="panel" id="startPanel">
+      <h1>AR-змейка</h1>
+      <p>
+        Программа включит камеру, найдёт человека в кадре и покажет светящиеся сегменты.
+        Дойдите до сегмента, чтобы он присоединился к вам и начал следовать как хвост.
+      </p>
+      <p>
+        Для работы нужны: камера, интернет и запуск по HTTPS или через localhost.
+      </p>
+      <label>
+        <input type="checkbox" id="useFront" />
+        Использовать фронтальную камеру
+      </label>
+      <button id="startBtn">Включить камеру</button>
+    </div>
+  </div>
+
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+
+    const video = $("video");
+    const canvas = $("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const overlay = $("overlay");
+    const startBtn = $("startBtn");
+    const useFrontCheckbox = $("useFront");
+
+    const hud = $("hud");
+    const scoreEl = $("score");
+    const targetsEl = $("targets");
+    const statusEl = $("status");
+
+    const switchBtn = $("switchBtn");
+    const restartBtn = $("restartBtn");
+    const stage = $("stage");
+
+    const CONFIG = {
+      // Сколько активных сегментов одновременно висит в кадре.
+      targetCount: 3,
+
+      // true: после сбора сегмента появляется новый, и хвост растёт бесконечно.
+      // false: всего будет только targetCount сегментов, собрал все - игра окончена.
+      respawnTargets: true,
+
+      // Радиус захвата сегмента человеком, доля от меньшей стороны видимой области.
+      collectionRadiusFactor: 0.15,
+
+      // Расстояние между сегментами хвоста.
+      segmentSpacingFactor: 0.055,
+      minSpacingPx: 26,
+
+      // Сглаживание позиции человека.
+      playerSmoothing: 0.35
+    };
+
+    let FilesetResolver = null;
+    let PoseLandmarker = null;
+    let landmarker = null;
+
+    let stream = null;
+    let running = false;
+
+    let player = null;
+    let lastSeen = 0;
+
+    let targets = [];
+    let tail = [];
+    let score = 0;
+
+    let useFrontCamera = !!useFrontCheckbox.checked;
+
+    useFrontCheckbox.addEventListener("change", () => {
+      useFrontCamera = useFrontCheckbox.checked;
+    });
+
+    startBtn.addEventListener("click", start);
+
+    restartBtn.addEventListener("click", () => {
+      resetGame();
+    });
+
+    switchBtn.addEventListener("click", async () => {
+      useFrontCamera = !useFrontCamera;
+      useFrontCheckbox.checked = useFrontCamera;
+      await restartCamera();
+    });
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function showError(error) {
+      console.error(error);
+      running = false;
+
+      overlay.hidden = false;
+      overlay.innerHTML = `
+        <div class="panel">
+          <h1>Ошибка запуска</h1>
+          <p>${escapeHtml(error?.message || String(error))}</p>
+          <p>
+            Проверьте доступ к камере, что страница открыта по HTTPS или через localhost,
+            и что есть интернет для загрузки модели распознавания человека.
+          </p>
+          <button id="reloadBtn">Перезагрузить страницу</button>
+        </div>
+      `;
+
+      document.getElementById("reloadBtn")?.addEventListener("click", () => {
+        location.reload();
+      });
+    }
+
+    async function start() {
+      try {
+        startBtn.disabled = true;
+        setStatus("Загрузка библиотек…");
+
+        await loadVisionLibraries();
+        await createPoseLandmarker();
+        await startCamera();
+
+        overlay.hidden = true;
+        hud.hidden = false;
+
+        resetGame();
+
+        running = true;
+        requestAnimationFrame(loop);
+      } catch (error) {
+        showError(error);
+      }
+    }
+
+    async function loadVisionLibraries() {
+      if (FilesetResolver && PoseLandmarker) return;
+
+      const mod = await import(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+      );
+
+      FilesetResolver = mod.FilesetResolver;
+      PoseLandmarker = mod.PoseLandmarker;
+    }
+
+    async function createPoseLandmarker() {
+      if (landmarker) return;
+
+      setStatus("Загрузка модели позы человека…");
+
+      const fileset = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+
+      const modelAssetPath =
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+      const commonOptions = {
+        runningMode: "VIDEO",
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.5,
+        minPosePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      };
+
+      try {
+        landmarker = await PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: {
+            modelAssetPath,
+            delegate: "GPU"
+          },
+          ...commonOptions
+        });
+      } catch (gpuError) {
+        console.warn("GPU delegate не запустился, пробуем CPU:", gpuError);
+
+        landmarker = await PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: {
+            modelAssetPath,
+            delegate: "CPU"
+          },
+          ...commonOptions
+        });
+      }
+    }
+
+    async function startCamera() {
+      if (!window.isSecureContext) {
+        throw new Error(
+          "Браузер требует безопасный контекст: откройте страницу через HTTPS или localhost."
+        );
+      }
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("getUserMedia не поддерживается в этом браузере.");
+      }
+
+      setStatus("Запрос доступа к камере…");
+
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+
+      const constraints = {
+        audio: false,
+        video: {
+          facingMode: {
+            ideal: useFrontCamera ? "user" : "environment"
+          },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      };
+
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+
+      await video.play();
+
+      if (!video.videoWidth) {
+        await new Promise((resolve) => {
+          video.addEventListener("loadedmetadata", resolve, { once: true });
+        });
+      }
+
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+
+      const videoTrack = stream.getVideoTracks()[0];
+      const settings = videoTrack.getSettings ? videoTrack.getSettings() : {};
+
+      const isFront =
+        settings.facingMode === "user" ||
+        (useFrontCamera && settings.facingMode !== "environment");
+
+      stage.classList.toggle("mirror", isFront);
+
+      player = null;
+      lastSeen = 0;
+    }
+
+    async function restartCamera() {
+      try {
+        await startCamera();
+        resetGame();
+      } catch (error) {
+        showError(error);
+      }
+    }
+
+    function resetGame() {
+      score = 0;
+      tail = [];
+      targets = [];
+      player = null;
+      lastSeen = 0;
+
+      for (let i = 0; i < CONFIG.targetCount; i++) {
+        targets.push(spawnTarget());
+      }
+
+      updateHud();
+      setStatus("Дойдите до светящегося сегмента");
+    }
+
+    function updateHud() {
+      scoreEl.textContent = score;
+      targetsEl.textContent = targets.length;
+    }
+
+    function dist(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    // Возвращает часть видеокадра, которая реально видна на экране при object-fit: cover.
+    // Это нужно, чтобы сегменты не появлялись за пределами видимой области.
+    function getVisibleVideoRect() {
+      const cssW = canvas.clientWidth || window.innerWidth;
+      const cssH = canvas.clientHeight || window.innerHeight;
+
+      const vw = canvas.width;
+      const vh = canvas.height;
+
+      if (!vw || !vh || !cssW || !cssH) {
+        return { x: 0, y: 0, w: vw || 1, h: vh || 1 };
+      }
+
+      const scale = Math.max(cssW / vw, cssH / vh);
+
+      const displayedW = vw * scale;
+      const displayedH = vh * scale;
+
+      const cropX = Math.max(0, (displayedW - cssW) / 2);
+      const cropY = Math.max(0, (displayedH - cssH) / 2);
+
+      return {
+        x: cropX / scale,
+        y: cropY / scale,
+        w: cssW / scale,
+        h: cssH / scale
+      };
+    }
+
+    function spawnTarget(avoidPoint = null) {
+      const view = getVisibleVideoRect();
+
+      if (!view.w || !view.h) {
+        return {
+          x: 100,
+          y: 100,
+          phase: 0,
+          born: performance.now()
+        };
+      }
+
+      const marginX = 0.14;
+      const marginY = 0.16;
+
+      const minSeparation = Math.min(view.w, view.h) * 0.22;
+
+      for (let attempt = 0; attempt < 60; attempt++) {
+        const x = view.x + (marginX + Math.random() * (1 - marginX * 2)) * view.w;
+        const y = view.y + (marginY + Math.random() * (1 - marginY * 2)) * view.h;
+
+        const point = { x, y };
+
+        if (avoidPoint && dist(point, avoidPoint) < minSeparation) {
+          continue;
+        }
+
+        if (targets.some((t) => dist(point, t) < minSeparation * 0.65)) {
+          continue;
+        }
+
+        return {
+          ...point,
+          phase: Math.random() * Math.PI * 2,
+          born: performance.now()
+        };
+      }
+
+      return {
+        x: view.x + view.w * (0.25 + Math.random() * 0.5),
+        y: view.y + view.h * (0.25 + Math.random() * 0.5),
+        phase: 0,
+        born: performance.now()
+      };
+    }
+
+    function loop(now) {
+      if (!running) return;
+
+      if (landmarker && video.readyState >= 2) {
+        try {
+          const result = landmarker.detectForVideo(video, now);
+          processPose(result, now);
+        } catch (error) {
+          console.warn("Ошибка распознавания позы:", error);
+        }
+      }
+
+      updateGame(now);
+      draw(now);
+
+      requestAnimationFrame(loop);
+    }
+
+    function processPose(result, now) {
+      const landmark = result?.landmarks?.[0];
+
+      if (!landmark) {
+        if (now - lastSeen > 700) {
+          setStatus("Человек не найден — встаньте в кадр");
+        }
+        return;
+      }
+
+      const isVisible = (index) => {
+        const p = landmark[index];
+        return p && (p.visibility === undefined || p.visibility > 0.35);
+      };
+
+      const points = [];
+
+      // Плечи и бедра дают более стабильный центр тела.
+      [11, 12, 23, 24].forEach((index) => {
+        if (isVisible(index)) {
+          points.push(landmark[index]);
+        }
+      });
+
+      // Если тела не видно, пытаемся хотя бы по голове/носу.
+      if (points.length === 0 && isVisible(0)) {
+        points.push(landmark[0]);
+      }
+
+      if (points.length === 0) {
+        if (now - lastSeen > 700) {
+          setStatus("Ищу человека…");
+        }
+        return;
+      }
+
+      const sum = points.reduce(
+        (acc, p) => ({ x: acc.x + p.x, y: acc.y + p.y }),
+        { x: 0, y: 0 }
+      );
+
+      const nx = sum.x / points.length;
+      const ny = sum.y / points.length;
+
+      const raw = {
+        x: nx * canvas.width,
+        y: ny * canvas.height
+      };
+
+      lastSeen = now;
+      setStatus("Человек найден");
+
+      if (!player) {
+        player = { ...raw };
+      } else {
+        player.x += (raw.x - player.x) * CONFIG.playerSmoothing;
+        player.y += (raw.y - player.y) * CONFIG.playerSmoothing;
+      }
+    }
+
+    function updateGame(now) {
+      const view = getVisibleVideoRect();
+
+      const playerVisible = !!player && now - lastSeen < 900;
+
+      const collectionRadius = Math.max(
+        50,
+        Math.min(view.w, view.h) * CONFIG.collectionRadiusFactor
+      );
+
+      if (playerVisible) {
+        for (let i = targets.length - 1; i >= 0; i--) {
+          const target = targets[i];
+
+          // Защита от мгновенного сбора только что появившегося сегмента.
+          if (target.born && now - target.born < 650) {
+            continue;
+          }
+
+          if (dist(player, target) < collectionRadius) {
+            tail.push({
+              x: target.x,
+              y: target.y
+            });
+
+            score += 1;
+
+            if (navigator.vibrate) {
+              navigator.vibrate(30);
+            }
+
+            if (CONFIG.respawnTargets) {
+              targets[i] = spawnTarget(player);
+            } else {
+              targets.splice(i, 1);
+            }
+
+            updateHud();
+          }
+        }
+
+        if (!CONFIG.respawnTargets && targets.length === 0) {
+          setStatus("Все сегменты собраны! Нажмите “Заново”");
+        }
+      }
+
+      const spacing = Math.max(
+        CONFIG.minSpacingPx,
+        Math.min(view.w, view.h) * CONFIG.segmentSpacingFactor
+      );
+
+      const head = player || {
+        x: canvas.width / 2,
+        y: canvas.height / 2
+      };
+
+      // Каждый сегмент следует за предыдущим: первый за человеком, второй за первым и т.д.
+      for (let i = 0; i < tail.length; i++) {
+        const prev = i === 0 ? head : tail[i - 1];
+        const segment = tail[i];
+
+        const dx = prev.x - segment.x;
+        const dy = prev.y - segment.y;
+
+        const d = Math.hypot(dx, dy);
+
+        if (d > spacing) {
+          const move = Math.min(d - spacing, Math.max(2, d * 0.28));
+
+          segment.x += (dx / d) * move;
+          segment.y += (dy / d) * move;
+        } else {
+          // Микроподтяжка, чтобы хвост не разрывался при резких скачках трекинга.
+          segment.x += dx * 0.002;
+          segment.y += dy * 0.002;
+        }
+      }
+    }
+
+    function draw(now) {
+      const w = canvas.width;
+      const h = canvas.height;
+
+      ctx.clearRect(0, 0, w, h);
+
+      if (!w || !h) return;
+
+      const base = Math.min(w, h);
+
+      drawTargets(now, base);
+      drawTail(base);
+      drawPlayer(now, base);
+    }
+
+    function drawTargets(now, base) {
+      for (const target of targets) {
+        const pulse = 1 + 0.16 * Math.sin(now / 280 + target.phase);
+        const radius = Math.max(20, base * 0.04) * pulse;
+
+        ctx.save();
+
+        ctx.shadowColor = "rgba(34, 197, 94, 0.95)";
+        ctx.shadowBlur = 28;
+
+        ctx.fillStyle = "rgba(34, 197, 94, 0.20)";
+        ctx.beginPath();
+        ctx.arc(target.x, target.y, radius * 1.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.shadowBlur = 16;
+        ctx.strokeStyle = "rgba(196, 255, 222, 0.96)";
+        ctx.lineWidth = Math.max(3, base * 0.004);
+
+        ctx.beginPath();
+        ctx.arc(target.x, target.y, radius, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.fillStyle = "rgba(226, 255, 238, 0.95)";
+        ctx.beginPath();
+        ctx.arc(target.x, target.y, Math.max(5, radius * 0.22), 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.restore();
+      }
+    }
+
+    function drawTail(base) {
+      if (tail.length === 0) return;
+
+      const head = player || {
+        x: canvas.width / 2,
+        y: canvas.height / 2
+      };
+
+      ctx.save();
+
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
+      ctx.strokeStyle = "rgba(16, 185, 129, 0.55)";
+      ctx.lineWidth = Math.max(6, base * 0.012);
+
+      ctx.beginPath();
+      ctx.moveTo(head.x, head.y);
+
+      for (const segment of tail) {
+        ctx.lineTo(segment.x, segment.y);
+      }
+
+      ctx.stroke();
+
+      for (let i = tail.length - 1; i >= 0; i--) {
+        const segment = tail[i];
+
+        const shrink = i / Math.max(1, tail.length);
+        const radius = Math.max(10, base * 0.030) * (1 - shrink * 0.45);
+
+        ctx.shadowColor = "rgba(16, 185, 129, 0.75)";
+        ctx.shadowBlur = 14;
+
+        ctx.fillStyle = `hsl(${150 + i * 5}, 85%, ${46 + (i % 2) * 7}%)`;
+
+        ctx.beginPath();
+        ctx.arc(segment.x, segment.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function drawPlayer(now, base) {
+      const w = canvas.width;
+      const h = canvas.height;
+
+      if (!player) {
+        ctx.save();
+
+        ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.font = `${Math.max(20, base * 0.035)}px system-ui`;
+        ctx.textAlign = "center";
+
+        ctx.fillText("Покажите человека в кадре", w / 2, h * 0.12);
+
+        ctx.restore();
+        return;
+      }
+
+      const visible = now - lastSeen < 900;
+
+      if (!visible) return;
+
+      const radius = Math.max(34, base * 0.075);
+      const view = getVisibleVideoRect();
+
+      const collectionRadius = Math.max(
+        50,
+        Math.min(view.w, view.h) * CONFIG.collectionRadiusFactor
+      );
+
+      ctx.save();
+
+      ctx.strokeStyle = "rgba(125, 211, 252, 0.95)";
+      ctx.lineWidth = Math.max(3, base * 0.004);
+      ctx.shadowColor = "rgba(125, 211, 252, 0.85)";
+      ctx.shadowBlur = 16;
+
+      ctx.beginPath();
+      ctx.arc(player.x, player.y, radius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(125, 211, 252, 0.18)";
+      ctx.lineWidth = Math.max(2, base * 0.002);
+
+      ctx.beginPath();
+      ctx.arc(player.x, player.y, collectionRadius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  </script>
+</body>
+</html>
